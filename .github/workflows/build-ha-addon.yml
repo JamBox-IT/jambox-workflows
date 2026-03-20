@@ -1,0 +1,195 @@
+name: Build HA Addon (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      addon_path:
+        description: 'Path to addon directory relative to repo root'
+        required: false
+        type: string
+        default: '.'
+      base_version:
+        description: 'HA base image Alpine version tag (e.g. 3.23)'
+        required: false
+        type: string
+        default: '3.23'
+    secrets:
+      DOCKERHUB_USERNAME:
+        description: 'DockerHub username (optional)'
+        required: false
+      DOCKERHUB_TOKEN:
+        description: 'DockerHub token (optional)'
+        required: false
+
+jobs:
+  # ============================================================================
+  # Parse config.yaml → produce build matrix
+  # ============================================================================
+  config:
+    name: Parse addon config
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:        ${{ steps.matrix.outputs.matrix }}
+      addon_slug:    ${{ steps.read.outputs.slug }}
+      addon_version: ${{ steps.read.outputs.version }}
+      addon_name:    ${{ steps.read.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read config.yaml
+        id: read
+        run: |
+          CFG="${{ inputs.addon_path }}/config.yaml"
+          [ -f "$CFG" ] || { echo "ERROR: $CFG not found"; exit 1; }
+
+          slug=$(grep -E '^slug:'    "$CFG" | sed 's/^slug:[[:space:]]*["'"'"']*//' | sed 's/["'"'"']*$//')
+          version=$(grep -E '^version:' "$CFG" | sed 's/^version:[[:space:]]*["'"'"']*//' | sed 's/["'"'"']*$//')
+          name=$(grep -E '^name:'    "$CFG" | sed 's/^name:[[:space:]]*["'"'"']*//' | sed 's/["'"'"']*$//')
+
+          [ -z "$slug" ] || [ -z "$version" ] && { echo "ERROR: could not parse slug/version"; exit 1; }
+
+          echo "slug=$slug"       >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=$name"       >> "$GITHUB_OUTPUT"
+
+      - name: Build arch matrix
+        id: matrix
+        run: |
+          CFG="${{ inputs.addon_path }}/config.yaml"
+          # Extract list items under arch:
+          arches=$(sed -n '/^arch:/,/^[^ ]/p' "$CFG" \
+            | grep -E '^\s+-' \
+            | sed 's/.*- //' \
+            | tr -d '"'"'" \
+            | jq -Rsc 'split("\n") | map(select(length>0)) | map({arch: .})')
+
+          echo "matrix=$arches" >> "$GITHUB_OUTPUT"
+          echo "Arch matrix: $arches"
+
+  # ============================================================================
+  # Build one image per architecture
+  # ============================================================================
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.config.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve base image and platform
+        id: arch
+        run: |
+          case "${{ matrix.arch }}" in
+            amd64)   base="amd64-base";   platform="linux/amd64"    ;;
+            aarch64) base="aarch64-base"; platform="linux/arm64"    ;;
+            armhf)   base="armhf-base";   platform="linux/arm/v6"   ;;
+            armv7)   base="armv7-base";   platform="linux/arm/v7"   ;;
+            i386)    base="i386-base";    platform="linux/386"      ;;
+            *) echo "Unknown arch: ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          echo "build_from=ghcr.io/home-assistant/${base}:${{ inputs.base_version }}" >> "$GITHUB_OUTPUT"
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        env:
+          SLUG:    ${{ needs.config.outputs.addon_slug }}
+          VERSION: ${{ needs.config.outputs.addon_version }}
+          ARCH:    ${{ matrix.arch }}
+          REPO:    ${{ github.repository }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          REF:     ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT:   ${{ github.event_name }}
+        run: |
+          GHCR="ghcr.io/${REPO}/${SLUG}"
+          DH="${DH_USER}/${SLUG}"
+
+          # Determine channel label based on ref
+          if [ "$EVENT" = "pull_request" ]; then
+            CHANNEL=""   # no push on PRs
+          elif echo "$REF" | grep -qE '^refs/tags/.*-beta'; then
+            CHANNEL="beta"
+          elif echo "$REF" | grep -qE '^refs/tags/.*-dev'; then
+            CHANNEL="dev"
+          elif echo "$REF" | grep -qE '^refs/tags/'; then
+            CHANNEL="release"
+          elif [ "$REF_NAME" = "beta" ]; then
+            CHANNEL="beta"
+          elif [ "$REF_NAME" = "main" ]; then
+            CHANNEL="edge"
+          else
+            CHANNEL="edge"
+          fi
+
+          # Build tag list
+          TAGS=""
+          add_tag() { TAGS="${TAGS:+${TAGS},}$1"; }
+
+          case "$CHANNEL" in
+            release)
+              add_tag "${GHCR}:${VERSION}-${ARCH}"
+              add_tag "${GHCR}:latest-${ARCH}"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}-${ARCH}" && add_tag "${DH}:latest-${ARCH}"
+              ;;
+            beta)
+              add_tag "${GHCR}:${VERSION}-${ARCH}"
+              add_tag "${GHCR}:beta-${ARCH}"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}-${ARCH}" && add_tag "${DH}:beta-${ARCH}"
+              ;;
+            dev)
+              add_tag "${GHCR}:${VERSION}-${ARCH}"
+              add_tag "${GHCR}:dev-${ARCH}"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}-${ARCH}" && add_tag "${DH}:dev-${ARCH}"
+              ;;
+            edge)
+              add_tag "${GHCR}:edge-${ARCH}"
+              [ -n "$DH_USER" ] && add_tag "${DH}:edge-${ARCH}"
+              ;;
+          esac
+
+          echo "tags=$TAGS"         >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL"   >> "$GITHUB_OUTPUT"
+          echo "push=$( [ -n "$TAGS" ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context:   ${{ inputs.addon_path }}
+          file:      ${{ inputs.addon_path }}/Dockerfile
+          platforms: ${{ steps.arch.outputs.platform }}
+          push:      ${{ steps.tags.outputs.push }}
+          build-args: |
+            BUILD_FROM=${{ steps.arch.outputs.build_from }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ needs.config.outputs.addon_name }}
+            org.opencontainers.image.version=${{ needs.config.outputs.addon_version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to:   type=gha,scope=${{ matrix.arch }},mode=max
