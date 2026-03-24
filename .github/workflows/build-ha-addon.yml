@@ -13,7 +13,6 @@ on:
         required: false
         type: string
         default: '3.23'
-    inputs:
       dockerhub_username:
         description: 'DockerHub username — set to enable DockerHub push'
         required: false
