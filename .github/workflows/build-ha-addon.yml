@@ -132,8 +132,10 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           EVENT:   ${{ github.event_name }}
         run: |
-          GHCR="ghcr.io/${REPO}/${SLUG}"
-          DH="${DH_USER}/${SLUG}"
+          # HA-native format: arch in image name, version as tag
+          # e.g. ghcr.io/owner/repo/slug-amd64:0.0.8
+          GHCR="ghcr.io/${REPO}/${SLUG}-${ARCH}"
+          DH="${DH_USER}/${SLUG}-${ARCH}"
 
           # Determine channel label based on ref
           if [ "$EVENT" = "pull_request" ]; then
@@ -158,23 +160,23 @@ jobs:
 
           case "$CHANNEL" in
             release)
-              add_tag "${GHCR}:${VERSION}-${ARCH}"
-              add_tag "${GHCR}:latest-${ARCH}"
-              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}-${ARCH}" && add_tag "${DH}:latest-${ARCH}"
+              add_tag "${GHCR}:${VERSION}"
+              add_tag "${GHCR}:latest"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}" && add_tag "${DH}:latest"
               ;;
             beta)
-              add_tag "${GHCR}:${VERSION}-${ARCH}"
-              add_tag "${GHCR}:beta-${ARCH}"
-              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}-${ARCH}" && add_tag "${DH}:beta-${ARCH}"
+              add_tag "${GHCR}:${VERSION}"
+              add_tag "${GHCR}:beta"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}" && add_tag "${DH}:beta"
               ;;
             dev)
-              add_tag "${GHCR}:${VERSION}-${ARCH}"
-              add_tag "${GHCR}:dev-${ARCH}"
-              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}-${ARCH}" && add_tag "${DH}:dev-${ARCH}"
+              add_tag "${GHCR}:${VERSION}"
+              add_tag "${GHCR}:dev"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}" && add_tag "${DH}:dev"
               ;;
             edge)
-              add_tag "${GHCR}:edge-${ARCH}"
-              [ -n "$DH_USER" ] && add_tag "${DH}:edge-${ARCH}"
+              add_tag "${GHCR}:edge"
+              [ -n "$DH_USER" ] && add_tag "${DH}:edge"
               ;;
           esac
 
