@@ -13,6 +13,12 @@ on:
         required: false
         type: string
         default: '3.23'
+    inputs:
+      dockerhub_username:
+        description: 'DockerHub username — set to enable DockerHub push'
+        required: false
+        type: string
+        default: ''
     secrets:
       DOCKERHUB_USERNAME:
         description: 'DockerHub username (optional)'
@@ -109,7 +115,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to DockerHub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        if: ${{ inputs.dockerhub_username != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
