@@ -1,0 +1,184 @@
+name: Build Docker Image (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      image_path:
+        description: 'Path to directory containing image.yaml and Dockerfile (relative to repo root)'
+        required: false
+        type: string
+        default: '.'
+      alpine_version:
+        description: 'Alpine version to pass as ALPINE_VERSION build-arg. Leave blank if unused.'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      DOCKERHUB_USERNAME:
+        description: 'DockerHub username (optional — skipped if absent)'
+        required: false
+      DOCKERHUB_TOKEN:
+        description: 'DockerHub access token (optional)'
+        required: false
+
+jobs:
+  # ============================================================================
+  # Parse image.yaml → platforms string and image metadata
+  # ============================================================================
+  config:
+    name: Parse image config
+    runs-on: ubuntu-latest
+    outputs:
+      platforms:     ${{ steps.parse.outputs.platforms }}
+      image_slug:    ${{ steps.parse.outputs.slug }}
+      image_version: ${{ steps.parse.outputs.version }}
+      image_name:    ${{ steps.parse.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse image.yaml
+        id: parse
+        run: |
+          CFG="${{ inputs.image_path }}/image.yaml"
+          [ -f "$CFG" ] || { echo "ERROR: $CFG not found"; exit 1; }
+
+          slug=$(grep -E '^slug:'    "$CFG" | sed 's/^slug:[[:space:]]*["'"'"']*//' | sed 's/["'"'"']*$//')
+          version=$(grep -E '^version:' "$CFG" | sed 's/^version:[[:space:]]*["'"'"']*//' | sed 's/["'"'"']*$//')
+          name=$(grep -E '^name:'    "$CFG" | sed 's/^name:[[:space:]]*["'"'"']*//' | sed 's/["'"'"']*$//')
+
+          [ -z "$slug" ] || [ -z "$version" ] && { echo "ERROR: could not parse slug/version from $CFG"; exit 1; }
+
+          # Convert arch list to comma-separated Docker platform string
+          platforms=""
+          while IFS= read -r arch; do
+            [ -z "$arch" ] && continue
+            case "$arch" in
+              amd64)   p="linux/amd64"   ;;
+              aarch64) p="linux/arm64"   ;;
+              armv7)   p="linux/arm/v7"  ;;
+              armhf)   p="linux/arm/v6"  ;;
+              i386)    p="linux/386"     ;;
+              *) echo "ERROR: unknown arch '$arch'"; exit 1 ;;
+            esac
+            platforms="${platforms:+${platforms},}${p}"
+          done < <(sed -n '/^arch:/,/^[^ ]/p' "$CFG" \
+                   | grep -E '^\s+-' \
+                   | sed 's/.*-[[:space:]]*//' \
+                   | tr -d '"'"'")
+
+          [ -z "$platforms" ] && { echo "ERROR: no arch entries found in $CFG"; exit 1; }
+
+          echo "slug=$slug"           >> "$GITHUB_OUTPUT"
+          echo "version=$version"     >> "$GITHUB_OUTPUT"
+          echo "name=$name"           >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          echo "Parsed: slug=$slug version=$version platforms=$platforms"
+
+  # ============================================================================
+  # Build multi-arch manifest and push
+  # ============================================================================
+  build:
+    name: Build & Push
+    needs: config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        env:
+          SLUG:     ${{ needs.config.outputs.image_slug }}
+          VERSION:  ${{ needs.config.outputs.image_version }}
+          REPO:     ${{ github.repository }}
+          DH_USER:  ${{ secrets.DOCKERHUB_USERNAME }}
+          REF:      ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT:    ${{ github.event_name }}
+        run: |
+          GHCR="ghcr.io/${REPO}/${SLUG}"
+          DH="${DH_USER}/${SLUG}"
+
+          # Determine channel from ref
+          if [ "$EVENT" = "pull_request" ]; then
+            CHANNEL=""   # build-only, no push
+          elif echo "$REF" | grep -qE '^refs/tags/.*-beta'; then
+            CHANNEL="beta"
+          elif echo "$REF" | grep -qE '^refs/tags/.*-dev'; then
+            CHANNEL="dev"
+          elif echo "$REF" | grep -qE '^refs/tags/'; then
+            CHANNEL="release"
+          elif [ "$REF_NAME" = "beta" ]; then
+            CHANNEL="beta"
+          elif [ "$REF_NAME" = "main" ]; then
+            CHANNEL="edge"
+          else
+            CHANNEL="edge"
+          fi
+
+          TAGS=""
+          add_tag() { TAGS="${TAGS:+${TAGS},}$1"; }
+
+          case "$CHANNEL" in
+            release)
+              add_tag "${GHCR}:${VERSION}"
+              add_tag "${GHCR}:latest"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}" && add_tag "${DH}:latest"
+              ;;
+            beta)
+              add_tag "${GHCR}:${VERSION}"
+              add_tag "${GHCR}:beta"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}" && add_tag "${DH}:beta"
+              ;;
+            dev)
+              add_tag "${GHCR}:${VERSION}"
+              add_tag "${GHCR}:dev"
+              [ -n "$DH_USER" ] && add_tag "${DH}:${VERSION}" && add_tag "${DH}:dev"
+              ;;
+            edge)
+              add_tag "${GHCR}:edge"
+              [ -n "$DH_USER" ] && add_tag "${DH}:edge"
+              ;;
+          esac
+
+          echo "tags=$TAGS"       >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "push=$( [ -n "$TAGS" ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+          echo "Channel: $CHANNEL  Tags: $TAGS"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context:   ${{ inputs.image_path }}
+          file:      ${{ inputs.image_path }}/Dockerfile
+          platforms: ${{ needs.config.outputs.platforms }}
+          push:      ${{ steps.tags.outputs.push }}
+          build-args: |
+            ${{ inputs.alpine_version != '' && format('ALPINE_VERSION={0}', inputs.alpine_version) || '' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ needs.config.outputs.image_name }}
+            org.opencontainers.image.version=${{ needs.config.outputs.image_version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=docker-image
+          cache-to:   type=gha,scope=docker-image,mode=max
